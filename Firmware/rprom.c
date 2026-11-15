@@ -49,8 +49,8 @@
 #define CYCLE_SLOT_TIMEOUT_US   3000000 // 3 seconds
 
 #define MAJOR_VERSION   1
-#define MINOR_VERSION   1
-#define PATCH_VERSION   2
+#define MINOR_VERSION   2
+#define PATCH_VERSION   0
 
 #define ROM_SLOT_SIZE   (512 * 1024)
 
@@ -59,6 +59,45 @@ static uint16_t rom_image[ROM_SLOT_SIZE / 2];
 
 #define CONFIG_SECTOR_OFFSET    (ROM_SLOT_SIZE - FLASH_SECTOR_SIZE)
 #define CONFIG_SECTOR_BASE      (XIP_BASE + CONFIG_SECTOR_OFFSET)
+
+int32_t last_slot_change_us = 0;
+
+//if time between last rom slot change and reset is greater then this the active rom slot is reverted to 0
+#define SLOT_CHANGE_REVERT_TIMEOUT_US 1000000 // 1 second
+
+volatile bool sram_rom_valid = false;
+volatile uint8_t sram_loaded_slot = 0;
+
+//if rom switchover handshake takes longer than this time the rom is switched over no matter what
+#define SLOT_SWITCHOVER_TIMEOUT_US 10000 // 10 ms
+
+// placeholder rom that is presented when the sram rom image is invalid, like during rom image switching
+// its a bootable short program that should just boot loop
+
+#define RB_TOP 0x0000
+const uint16_t placeholder_rom[256] = {
+    //rom base is at 0xFC0000 even tho 500+ and later map it starting at 0xF80000
+    //going by board schematics A18 doesnt get inverted so the reset jump should be different
+    //but kickstart jumps to FC0000 even on A500+ and later
+    //sooooo....
+    //but since this placeholder rom get mirrored accross the entire rom it doesnt actually mater
+    //assume rom is at 0, this should also make it compatible with other 68k systems
+    0x0000, 0x0000, //.dl 0x00000000        EVT[0]: Initial stack pointer
+    RB_TOP, 0x0008, //.dl .begin            EVT[1]: Initial program counter
+                    //.begin:
+    0x007C, 0x0700, //ori #$0700            disable interrupts
+    0x2E79,         //movea.l (EVT[0]), A7 
+    RB_TOP, 0x0000,  //                      load initial stack pointer from rom
+    0x2C79,         //movea.l (EVT[1]), A6
+    RB_TOP, 0x0004,  //                      load initial program counter from rom
+    0x4ED6,         //jmp (A6)              jump to initial program counter
+    //adr 1A
+    0x0000, 0x0000, 0x0000,  //buffer to address 0x20
+    RB_TOP, 0x0008  //.dl .begin            EVT[8]: Privilege violation, in case the ori instruction happens in user mode
+    //rest of the boot loop rom is zero
+    //could put a status byte here to show the progress of the memcpy
+    //or a toggle bit like with parallel EEPROMs to tell if its done programming
+};
 
 struct ConfigTuple
 {
@@ -80,6 +119,19 @@ static inline uint32_t get_active_rom_slot()
     uint32_t active_tuple = __builtin_ctz(pages[active_page].tuples_bitmap);
     uint32_t rom_slot = pages[active_page].tuples[active_tuple].rom_slot;
     return (rom_slot == 0 || rom_slot >= 8) ? 1 : rom_slot;
+}
+
+static inline uint8_t get_loaded_rom_slot() {
+    return sram_loaded_slot;
+}
+
+static void set_sram_rom_slot(uint32_t rom_slot) {
+    if (rom_slot < 0 || rom_slot >= 7) return;
+    sram_loaded_slot = rom_slot;
+    uint32_t rom_slot_base = XIP_BASE + (rom_slot * ROM_SLOT_SIZE);
+    sram_rom_valid = false;
+    memcpy(rom_image, (const void *) rom_slot_base, sizeof(rom_image));
+    sram_rom_valid = true;
 }
 
 static void update_active_rom_slot_in_flash(uint32_t rom_slot)
@@ -119,6 +171,16 @@ static void update_active_rom_slot_in_flash(uint32_t rom_slot)
     }
 }
 
+static void reset_active_rom_slot() {
+    int32_t time_diff = time_us_32() - last_slot_change_us;
+    if (time_diff < 0 || time_diff > SLOT_CHANGE_REVERT_TIMEOUT_US) {
+        // revert the active rom slot to 1 for bootmenu
+        // dont update flash config, this is only temporary
+        set_sram_rom_slot(1);
+    }
+
+}
+
 static void cycle_active_rom_slot()
 {
     uint32_t prev_rom_slot = get_active_rom_slot();
@@ -135,14 +197,12 @@ static void cycle_active_rom_slot()
 
         // Check if this looks like a valid rom image.
         uint32_t rom_slot_base = XIP_BASE + rom_slot * ROM_SLOT_SIZE;
-        if (*(uint8_t *)rom_slot_base == 0x11)
+        if (*(uint8_t *)rom_slot_base == 0x11) //why does the first byte being 0x11 check if its a valid rom image? that should be the MSB of the stack pointer reset value
             break;
     }
 
     update_active_rom_slot_in_flash(rom_slot);
-
-    uint32_t rom_slot_base = XIP_BASE + rom_slot * ROM_SLOT_SIZE;
-    memcpy(rom_image, (const void *)rom_slot_base, sizeof(rom_image));
+    set_sram_rom_slot(rom_slot);
 }
 
 static void handle_magic_read(uint32_t address)
@@ -159,9 +219,8 @@ static void handle_magic_read(uint32_t address)
                 return;
 
             update_active_rom_slot_in_flash(rom_slot);
-
-            uint32_t rom_slot_base = XIP_BASE + rom_slot * ROM_SLOT_SIZE;
-            memcpy(rom_image, (const void *)rom_slot_base, sizeof(rom_image));
+            set_sram_rom_slot(rom_slot);
+            last_slot_change_us = time_us_32();
             break;
         }
         case CMD_WRITE_STATUS_TO_SRAM:
@@ -175,14 +234,14 @@ static void handle_magic_read(uint32_t address)
                 .patch_version = PATCH_VERSION,
                 .flash_size_mb = 4,
                 .active_rom_slot = (uint8_t)get_active_rom_slot(),
+                .loaded_rom_slot = (uint8_t)get_loaded_rom_slot()
             };
             break;
         }
         case CMD_RESTORE_PAGE_TO_SRAM:
         {
             const uint32_t rom_slot = get_active_rom_slot();
-            const uint32_t rom_slot_base = XIP_BASE + rom_slot * ROM_SLOT_SIZE;
-            memcpy(rom_image, (const void *)rom_slot_base, FLASH_PAGE_SIZE + 2);
+            set_sram_rom_slot(rom_slot);
             break;
         }
         case CMD_COPY_PAGE_AMIGA_TO_SRAM:
@@ -200,7 +259,9 @@ static void handle_magic_read(uint32_t address)
         case CMD_COPY_PAGE_FLASH_TO_SRAM:
         {
             rom_image[128] = 0xffff;
+            sram_rom_valid = false;
             memcpy(rom_image, (const void *)(XIP_BASE + arg * FLASH_PAGE_SIZE), FLASH_PAGE_SIZE);
+            sram_rom_valid = true;
             rom_image[128] = 0;
             break;
         }
@@ -231,29 +292,21 @@ static void __not_in_flash_func(core1_main)()
         {
             uint32_t address = sio_hw->fifo_rd;
 
-            if (magic_counter == 0)
-            {
-                if (address == MAGIC_ADDR_0)
-                    magic_counter++;
-            }
-            else if (magic_counter == 1)
-            {
-                if (address == MAGIC_ADDR_1)
-                    magic_counter++;
-                else
+            // the previous if else if snake was begging to be turned into a nice switch case state machine :3
+            const uint32_t magic_array[] = {MAGIC_ADDR_0, MAGIC_ADDR_1, MAGIC_ADDR_2};
+            switch (magic_counter) {
+                case 0:
+                case 1:
+                case 2:
+                    magic_counter = (magic_array[magic_counter] == address) ? magic_counter++ : 0;
+                default:
+                    //handle_magic_read is problematic because it can stall on an amiga to sram transfer if the amiga doesnt send 128 bytes
+                    //problem is that a reset can not reset the state of the rom emulator since reset is handled on the same core
+                    //this likely to cause crashing
+                    //TODO: fix
+                    handle_magic_read(address);
                     magic_counter = 0;
-            }
-            else if (magic_counter == 2)
-            {
-                if (address == MAGIC_ADDR_2)
-                    magic_counter++;
-                else
-                    magic_counter = 0;
-            }
-            else
-            {
-                handle_magic_read(address);
-                magic_counter = 0;
+                    break;
             }
         }
         else if (!gpio_get(RESET_PIN))
@@ -262,6 +315,7 @@ static void __not_in_flash_func(core1_main)()
 
             while (!gpio_get(RESET_PIN))
             {
+                reset_active_rom_slot();
                 int32_t elapsed = time_us_32() - reset_started;
                 if (elapsed >= CYCLE_SLOT_TIMEOUT_US)
                 {
@@ -279,8 +333,12 @@ static void __not_in_flash_func(core1_main)()
     }
 }
 
-static void __not_in_flash_func(core0_main)(bool a500_rev5)
+static void __not_in_flash_func(core0_main)(bool a500_rev5) 
 {
+    static bool rom_switchover = false;
+    static int32_t rom_switch_timeout = 0;
+    static int switchover_state = 0;
+
     if (a500_rev5)
     {
         while (1)
@@ -288,11 +346,60 @@ static void __not_in_flash_func(core0_main)(bool a500_rev5)
             uint32_t address = pio_sm_get_blocking(ADDRESS_PIO, ADDRESS_SM);
             address = ((address >> 1) & (1 << 17)) | (address & ((1 << 17) - 1));
 
-            //uint32_t data = (uint32_t)__builtin_bswap16(rom_image[address]);
             uint32_t data;
-            asm ("ldrh %0, [%1, %2, lsl #1]\n\t"
-                "rev16 %0, %0"
-                : "=r"(data) : "r"(rom_image), "r"(address));
+            //check if the current rom image is actually valid
+            if (sram_rom_valid && !rom_switchover) {
+                //if it is use some assembler trickery to swap the endianness
+                // equivalent to: uint32_t data = (uint32_t)__builtin_bswap16(rom_image[address]);
+                asm ("ldrh %0, [%1, %2, lsl #1]\n\t"
+                    "rev16 %0, %0"
+                    : "=r"(data) : "r"(rom_image), "r"(address));
+            } else if (sram_rom_valid && rom_switchover) {
+                //if it now is but we were on the place holder rom only switch to the new rom when the CPU fetches the reset program counter
+                //this avoids the system crashing on switchover when the bootrom is executing
+                //the time checking shouldnt nuke performance to bad
+                //non the less there is now 3 decision jumps and one time fetch more to calculate
+                //it should be OK...
+                if (time_us_32() > rom_switch_timeout) {
+                    asm ("ldrh %0, [%1, %2, lsl #1]\n\t"
+                    "rev16 %0, %0"
+                    : "=r"(data) : "r"(rom_image), "r"(address));
+                    switchover_state = 0;
+                    rom_switchover = false;
+                } else switch (switchover_state) {
+                    case 0:
+                        switchover_state = ((address & 0xfe) == 0x00) ? 1 : 0; //go to next state when initial stack pointer gets read
+                        data = placeholder_rom[address & 0xff];
+                        break;
+                    case 1:
+                        switchover_state = ((address & 0xfe) == 0x02) ? 2 : 1; //go to next state when initial program counter gets read (this time from the move)
+                        data = placeholder_rom[address & 0xff];
+                        break;
+                    case 2:
+                        switchover_state = ((address & 0xfe) != 0x02) ? 3 : 2; //go to next state when reading any other address but initial program counter
+                        data = placeholder_rom[address & 0xff];
+                        break;
+                    case 3:
+                        if ((address & 0xfe) == 0x02) {
+                            //handshake complete on reset vector read, switch to actual rom
+                            asm ("ldrh %0, [%1, %2, lsl #1]\n\t"
+                            "rev16 %0, %0"
+                            : "=r"(data) : "r"(rom_image), "r"(address));
+                            switchover_state = 0;
+                            rom_switchover = false;
+                        }
+                        break;
+                    default:
+                        switchover_state = 0;
+                        data = placeholder_rom[address & 0xff];
+                        break;
+                }
+            } else {
+                //if it isnt valid use the place holder rom
+                data = placeholder_rom[address & 0xff];
+                rom_switchover = true;
+                rom_switch_timeout = time_us_32() + SLOT_SWITCHOVER_TIMEOUT_US;
+            }
 
             pio_sm_put(DATA_PIO, DATA_SM, data);
 
@@ -450,13 +557,14 @@ void __not_in_flash_func(main)()
         gpio_set_function(i, i < 16 ? GPIO_FUNC_PIO0 : GPIO_FUNC_SIO);
 
     gpio_pull_up(RESET_PIN);
-
+    //figure out if the RPROM is in an a500 rev 5
+    //on rev 5 the BYTE/WORD pin is connected to A18
+    //on later boards it is connected to VCC
+    //assuming that the processor cant have run to far since the bootup A18 should be low
+    //if the BYTE pin is low then its an A500 rev 5 and BYTE should be treated like A18
+    //if the BYTE pin is high then its likely a rev 6 or later using pin 1 of the rom chip for A18
     gpio_pull_down(BYTE_PIN);
-
-    const uint32_t rom_slot = get_active_rom_slot();
-    const uint32_t rom_slot_base = XIP_BASE + rom_slot * ROM_SLOT_SIZE;
-    memcpy(rom_image, (const void *)rom_slot_base, sizeof(rom_image));
-
+    sleep_us(100);
     bool a500_rev5 = gpio_get(BYTE_PIN) == 0;
     gpio_disable_pulls(BYTE_PIN);
 
@@ -464,7 +572,13 @@ void __not_in_flash_func(main)()
 
     setup_address_pio_state_machines(a500_rev5);
 
+    //launch the memory access handling core before actually copying the rom image
+    //it will provide the placeholder rom and handle switchover to the actual rom when it is loaded
+    //if everything works correctly this code should be reached before the amiga exits reset on powerup
+    sram_rom_valid = false;
     multicore_launch_core1(core1_main);
+    //load the boot menu rom
+    set_sram_rom_slot(1);
 
     core0_main(a500_rev5);
 }

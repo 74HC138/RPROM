@@ -23,7 +23,8 @@ struct StatusV1
     uint8_t minor_version;
     uint8_t patch_version;
     uint8_t flash_size_mb;
-    uint8_t active_rom_slot;
+    uint8_t active_rom_slot; //the default rom slot in the config saved on the RPROM
+    uint8_t loaded_rom_slot; //the actually currently loaded rom slot in SRAM
 };
 
 #define STATUS_V1_MAGIC "RPRM"

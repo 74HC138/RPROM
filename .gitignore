@@ -8,3 +8,12 @@ Hardware/*/KiCad/out
 Hardware/*/KiCad/RPROM-backups
 Hardware/*/KiCad/fp-info-cache
 Hardware/*/KiCad/RPROM.kicad_prl
+.vscode
+Firmware/cmake_install.cmake
+Firmware/CMakeCache.txt
+Firmware/_deps
+Firmware/rprom.elf.map
+Firmware/CMakeFiles
+Firmware/generated
+Firmware/pico-sdk
+Firmware/Makefile
