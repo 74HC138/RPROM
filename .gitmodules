@@ -1,0 +1,3 @@
+[submodule "Bootmenu/toolchain"]
+	path = Bootmenu/toolchain
+	url = https://github.com/tomstorey/m68k_bare_metal.git

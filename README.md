@@ -79,6 +79,10 @@ Note that there is a `RPROM_REV` compile definition in
 hardware revision that the firmware should be used with. Make sure you set it to
 the correct value.
 
+## Compiling the bootmenu ROM
+
+The bootmenu ROM uses the [m68k bare metal](https://github.com/tomstorey/m68k_bare_metal) toolchain
+
 ## License
 
 This design is free for non-comercial use. The designers take no responsibility
