@@ -1,3 +1,6 @@
 [submodule "Bootmenu/toolchain"]
 	path = Bootmenu/toolchain
 	url = https://github.com/tomstorey/m68k_bare_metal.git
+[submodule "Bootmenu/include/font8x8"]
+	path = Bootmenu/include/font8x8
+	url = https://github.com/dhepper/font8x8.git
